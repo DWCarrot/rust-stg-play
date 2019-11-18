@@ -1,0 +1,491 @@
+#[cfg(feature = "dx12")]
+use gfx_backend_dx12 as back;
+#[cfg(feature = "metal")]
+use gfx_backend_metal as back;
+#[cfg(feature = "vulkan")]
+use gfx_backend_vulkan as back;
+
+use std::ptr;
+use std::rc::Rc;
+use std::cell::RefCell;
+use std::mem;
+
+use core::mem::ManuallyDrop;
+use gfx_hal::adapter::{Adapter, PhysicalDevice, Gpu, MemoryType};
+use gfx_hal::buffer::{Usage};
+use gfx_hal::memory;
+use gfx_hal::pso;
+use gfx_hal::pso::{DescriptorBinding, DescriptorArrayIndex,DescriptorSetLayoutBinding, DescriptorPool};
+use gfx_hal::command::{ClearColor, ClearValue, CommandBuffer, Level};
+use gfx_hal::device::Device;
+use gfx_hal::format::{Aspects, ChannelType, Format, Swizzle};
+use gfx_hal::image::{Extent, Layout, SubresourceRange, ViewKind};
+use gfx_hal::pass::{Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, SubpassDesc};
+use gfx_hal::pool::{CommandPool, CommandPoolCreateFlags};
+use gfx_hal::pso::{PipelineStage, Rect};
+use gfx_hal::queue::{Submission, QueueGroup, QueueType, QueueFamily};
+use gfx_hal::window::{Surface, PresentMode, Swapchain, SwapchainConfig};
+use gfx_hal::{Backend, Instance, Features, Limits};
+
+use winit::Window;
+
+//type Result<T> = std::result::Result<T, Box<std::error::Error>>;
+
+
+/**
+ * 
+ */
+
+pub struct BackendState<B: Backend> {
+    instance: Option<B::Instance>,
+    surface: ManuallyDrop<B::Surface>,
+    adapter: AdapterState<B>
+}
+
+impl<B: Backend> Drop for BackendState<B> {
+    fn drop(&mut self) {
+        if let Some(instance) = &self.instance {
+            unsafe {
+                let surface = ManuallyDrop::into_inner(ptr::read(&self.surface));
+                instance.destroy_surface(surface);
+            }
+        }
+    }
+}
+
+impl<B: Backend> BackendState<B> {
+    pub fn new(window: &Window) -> Self {
+        let instance = B::Instance::create("gfx-rs colour-uniform", 1).unwrap();
+        let surface = unsafe {
+            instance.create_surface(window).unwrap()
+        };
+        let mut adapters = instance.enumerate_adapters();
+        BackendState {
+            instance: Some(instance),
+            adapter: AdapterState::new(&mut adapters),
+            surface: ManuallyDrop::new(surface),
+        }
+    }
+}
+
+/**
+ * 
+ */
+
+pub struct AdapterState<B: Backend> {
+    adapter: Option<Adapter<B>>,
+    memory_types: Vec<MemoryType>,
+    limits: Limits,
+}
+
+impl<B: Backend> AdapterState<B> {
+    pub fn new(adapters: &mut Vec<Adapter<B>>) -> Self {
+        print!("Chosen: ");
+
+        for adapter in adapters.iter() {
+            println!("{:?}", adapter.info); //TODO: choose
+        }
+
+        AdapterState::<B>::new_adapter(adapters.remove(0))
+    }
+
+    pub fn new_adapter(adapter: Adapter<B>) -> Self {
+        let memory_types = adapter.physical_device.memory_properties().memory_types;
+        let limits = adapter.physical_device.limits();
+        println!("{:?}", limits);
+
+        AdapterState {
+            adapter: Some(adapter),
+            memory_types,
+            limits,
+        }
+    }
+}
+
+/**
+ * 
+ */
+
+pub struct DeviceState<B: Backend> {
+    device: B::Device,
+    physical_device: B::PhysicalDevice,
+    queues: QueueGroup<B>,
+}
+
+impl<B: Backend> DeviceState<B> {
+    pub fn new(adapter: Adapter<B>, surface: &B::Surface) -> Self {
+        let family = adapter
+            .queue_families
+            .iter()
+            .find(|family| {
+                surface.supports_queue_family(family) && family.queue_type().supports_graphics()
+            })
+            .unwrap();
+        let mut gpu = unsafe {
+            adapter
+                .physical_device
+                .open(&[(family, &[1.0])], gfx_hal::Features::empty())
+                .unwrap()
+        };
+
+        DeviceState {
+            device: gpu.device,
+            queues: gpu.queue_groups.pop().unwrap(),
+            physical_device: adapter.physical_device,
+        }
+    }
+}
+
+/**
+ * 
+ */
+
+// struct RenderPassState<B: Backend> {
+//     render_pass: Option<B::RenderPass>,
+//     device: Rc<RefCell<DeviceState<B>>>,
+// }
+
+// impl<B: Backend> RenderPassState<B> {
+//     unsafe fn new(swapchain: &SwapchainState<B>, device: Rc<RefCell<DeviceState<B>>>) -> Self {
+//         let render_pass = {
+//             let attachment = pass::Attachment {
+//                 format: Some(swapchain.format.clone()),
+//                 samples: 1,
+//                 ops: pass::AttachmentOps::new(
+//                     pass::AttachmentLoadOp::Clear,
+//                     pass::AttachmentStoreOp::Store,
+//                 ),
+//                 stencil_ops: pass::AttachmentOps::DONT_CARE,
+//                 layouts: i::Layout::Undefined .. i::Layout::Present,
+//             };
+
+//             let subpass = pass::SubpassDesc {
+//                 colors: &[(0, i::Layout::ColorAttachmentOptimal)],
+//                 depth_stencil: None,
+//                 inputs: &[],
+//                 resolves: &[],
+//                 preserves: &[],
+//             };
+
+//             device
+//                 .borrow()
+//                 .device
+//                 .create_render_pass(&[attachment], &[subpass], &[])
+//                 .ok()
+//         };
+
+//         RenderPassState {
+//             render_pass,
+//             device,
+//         }
+//     }
+// }
+
+// impl<B: Backend> Drop for RenderPassState<B> {
+//     fn drop(&mut self) {
+//         let device = &self.device.borrow().device;
+//         unsafe {
+//             device.destroy_render_pass(self.render_pass.take().unwrap());
+//         }
+//     }
+// }
+
+/**
+ * 
+ */
+
+struct BufferState<B: Backend> {
+    memory: Option<B::Memory>,
+    buffer: Option<B::Buffer>,
+    device: Rc<RefCell<DeviceState<B>>>,
+    size: u64,
+}
+
+impl<B: Backend> BufferState<B> {
+    fn get_buffer(&self) -> &B::Buffer {
+        self.buffer.as_ref().unwrap()
+    }
+
+    unsafe fn new<T: Copy>(
+        device_ptr: Rc<RefCell<DeviceState<B>>>,
+        data_source: &[T],
+        usage: Usage,
+        memory_types: &[MemoryType],
+    ) -> Self {
+        let memory: B::Memory;
+        let mut buffer: B::Buffer;
+        let size: u64;
+
+        let stride = mem::size_of::<T>();
+        let upload_size = data_source.len() * stride;
+
+        {
+            let device = &device_ptr.borrow().device;
+
+            buffer = device.create_buffer(upload_size as u64, usage).unwrap();
+            let mem_req = device.get_buffer_requirements(&buffer);
+
+            // A note about performance: Using CPU_VISIBLE memory is convenient because it can be
+            // directly memory mapped and easily updated by the CPU, but it is very slow and so should
+            // only be used for small pieces of data that need to be updated very frequently. For something like
+            // a vertex buffer that may be much larger and should not change frequently, you should instead
+            // use a DEVICE_LOCAL buffer that gets filled by copying data from a CPU_VISIBLE staging buffer.
+            let upload_type = memory_types
+                .iter()
+                .enumerate()
+                .position(|(id, mem_type)| {
+                    mem_req.type_mask & (1 << id) != 0
+                        && mem_type.properties.contains(memory::Properties::CPU_VISIBLE | memory::Properties::COHERENT)
+                })
+                .unwrap()
+                .into();
+
+            memory = device.allocate_memory(upload_type, mem_req.size).unwrap();
+            device.bind_buffer_memory(&memory, 0, &mut buffer).unwrap();
+            size = mem_req.size;
+
+            // TODO: check transitions: read/write mapping and vertex buffer read
+            let mapping = device.map_memory(&memory, 0 .. size).unwrap();
+            ptr::copy_nonoverlapping(data_source.as_ptr() as *const u8, mapping, upload_size);
+            device.unmap_memory(&memory);
+        }
+
+        BufferState {
+            memory: Some(memory),
+            buffer: Some(buffer),
+            device: device_ptr,
+            size,
+        }
+    }
+
+    fn update_data<T>(&mut self, offset: u64, data_source: &[T])
+    where
+        T: Copy,
+    {
+        let device = &self.device.borrow().device;
+
+        let stride = mem::size_of::<T>();
+        let upload_size = data_source.len() * stride;
+
+        assert!(offset + upload_size as u64 <= self.size);
+        let memory = self.memory.as_ref().unwrap();
+
+        unsafe {
+            let mapping = device.map_memory(memory, offset .. self.size).unwrap();
+            ptr::copy_nonoverlapping(data_source.as_ptr() as *const u8, mapping, upload_size);
+            device.unmap_memory(memory);
+        }
+    }
+
+    unsafe fn new_texture(
+        device_ptr: Rc<RefCell<DeviceState<B>>>,
+        device: &B::Device,
+        img: (usize, usize, usize, Vec<u8>) /* (width, height, depth, data) */,
+        adapter: &AdapterState<B>,
+        usage: Usage,
+    ) -> (Self, u32, u32, u32, usize) {
+        let (width, height, depth, data) = img;
+
+        let row_alignment_mask = adapter.limits.optimal_buffer_copy_pitch_alignment as u32 - 1;
+        let stride = depth;
+
+        let row_pitch = (width as u32 * stride as u32 + row_alignment_mask) & !row_alignment_mask;
+        let upload_size = (height as u32 * row_pitch) as u64;
+
+        let memory: B::Memory;
+        let mut buffer: B::Buffer;
+        let size: u64;
+
+        {
+            buffer = device.create_buffer(upload_size, usage).unwrap();
+            let mem_reqs = device.get_buffer_requirements(&buffer);
+
+            let upload_type = adapter
+                .memory_types
+                .iter()
+                .enumerate()
+                .position(|(id, mem_type)| {
+                    mem_reqs.type_mask & (1 << id) != 0
+                        && mem_type.properties.contains(memory::Properties::CPU_VISIBLE | memory::Properties::COHERENT)
+                })
+                .unwrap()
+                .into();
+
+            memory = device.allocate_memory(upload_type, mem_reqs.size).unwrap();
+            device.bind_buffer_memory(&memory, 0, &mut buffer).unwrap();
+            size = mem_reqs.size;
+
+            // copy image data into staging buffer
+            let mapping = device.map_memory(&memory, 0 .. size).unwrap();
+            for y in 0 .. height as usize {
+                let data_source_slice = &data[y * width * stride .. (y + 1) * width * stride];
+                ptr::copy_nonoverlapping(
+                    data_source_slice.as_ptr(),
+                    mapping.offset(y as isize * row_pitch as isize),
+                    data_source_slice.len(),
+                );
+            }
+            device.unmap_memory(&memory);
+        }
+        (
+            BufferState {
+                memory: Some(memory),
+                buffer: Some(buffer),
+                device: device_ptr,
+                size,
+            },
+            width as u32, 
+            height as u32,
+            row_pitch,
+            stride,
+        )
+    }
+}
+
+impl<B: Backend> Drop for BufferState<B> {
+    fn drop(&mut self) {
+        let device = &self.device.borrow().device;
+        unsafe {
+            device.destroy_buffer(self.buffer.take().unwrap());
+            device.free_memory(self.memory.take().unwrap());
+        }
+    }
+}
+
+/**
+ * 
+ */
+
+struct Uniform<B: Backend> {
+    buffer: Option<BufferState<B>>,
+    desc: Option<DescSet<B>>,
+}
+
+impl<B: Backend> Uniform<B> {
+    unsafe fn new<T: Copy>(
+        device: Rc<RefCell<DeviceState<B>>>,
+        memory_types: &[MemoryType],
+        data: &[T],
+        mut desc: DescSet<B>,
+        binding: u32,
+    ) -> Self {
+        let buffer = BufferState::new(
+            Rc::clone(&device),
+            &data,
+            Usage::UNIFORM,
+            memory_types,
+        );
+        let buffer = Some(buffer);
+
+        desc.write_to_state(
+            vec![DescSetWrite {
+                binding,
+                array_offset: 0,
+                descriptors: Some(pso::Descriptor::Buffer(
+                    buffer.as_ref().unwrap().get_buffer(),
+                    None .. None,
+                )),
+            }],
+            &mut device.borrow_mut().device,
+        );
+
+        Uniform {
+            buffer,
+            desc: Some(desc),
+        }
+    }
+
+    fn get_layout(&self) -> &B::DescriptorSetLayout {
+        self.desc.as_ref().unwrap().get_layout()
+    }
+}
+
+/**
+ * 
+ */
+
+struct DescSetLayout<B: Backend> {
+    layout: Option<B::DescriptorSetLayout>,
+    device: Rc<RefCell<DeviceState<B>>>,
+}
+
+impl<B: Backend> DescSetLayout<B> {
+    unsafe fn new(
+        device: Rc<RefCell<DeviceState<B>>>,
+        bindings: Vec<DescriptorSetLayoutBinding>,
+    ) -> Self {
+        let desc_set_layout = device
+            .borrow()
+            .device
+            .create_descriptor_set_layout(bindings, &[])
+            .ok();
+
+        DescSetLayout {
+            layout: desc_set_layout,
+            device,
+        }
+    }
+
+    unsafe fn create_desc_set(self, desc_pool: &mut B::DescriptorPool) -> DescSet<B> {
+        let desc_set = desc_pool
+            .allocate_set(self.layout.as_ref().unwrap())
+            .unwrap();
+        DescSet {
+            layout: self,
+            set: Some(desc_set),
+        }
+    }
+}
+
+impl<B: Backend> Drop for DescSetLayout<B> {
+    fn drop(&mut self) {
+        let device = &self.device.borrow().device;
+        unsafe {
+            device.destroy_descriptor_set_layout(self.layout.take().unwrap());
+        }
+    }
+}
+
+/**
+ * 
+ */
+
+struct DescSet<B: Backend> {
+    set: Option<B::DescriptorSet>,
+    layout: DescSetLayout<B>,
+}
+
+struct DescSetWrite<W> {
+    binding: DescriptorBinding,
+    array_offset: DescriptorArrayIndex,
+    descriptors: W,
+}
+
+impl<B: Backend> DescSet<B> {
+    unsafe fn write_to_state<'a, 'b: 'a, W>(
+        &'b mut self,
+        write: Vec<DescSetWrite<W>>,
+        device: &mut B::Device,
+    ) where
+        W: IntoIterator,
+        W::Item: std::borrow::Borrow<pso::Descriptor<'a, B>>,
+    {
+        let set = self.set.as_ref().unwrap();
+        let write: Vec<_> = write
+            .into_iter()
+            .map(|d| pso::DescriptorSetWrite {
+                binding: d.binding,
+                array_offset: d.array_offset,
+                descriptors: d.descriptors,
+                set,
+            })
+            .collect();
+        device.write_descriptor_sets(write);
+    }
+
+    fn get_layout(&self) -> &B::DescriptorSetLayout {
+        self.layout.layout.as_ref().unwrap()
+    }
+}
+
+
